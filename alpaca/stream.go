@@ -2,9 +2,11 @@ package alpaca
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,8 +26,9 @@ const (
 )
 
 var (
-	once sync.Once
-	str  *Stream
+	once      sync.Once
+	str       *Stream
+	streamUrl = ""
 
 	dataOnce sync.Once
 	dataStr  *Stream
@@ -76,6 +79,24 @@ func (s *Stream) Subscribe(channel string, handler func(msg interface{})) (err e
 		s.handlers.Delete(channel)
 		return
 	}
+	return
+}
+
+// Unsubscribe the specified Polygon stream channel.
+func (s *Stream) Unsubscribe(channel string) (err error) {
+	if s.conn == nil {
+		err = errors.New("not yet subscribed to any channel")
+		return
+	}
+
+	if err = s.auth(); err != nil {
+		return
+	}
+
+	s.handlers.Delete(channel)
+
+	err = s.unsub(channel)
+
 	return
 }
 
@@ -202,6 +223,26 @@ func (s *Stream) sub(channel string) (err error) {
 	return
 }
 
+func (s *Stream) unsub(channel string) (err error) {
+	s.Lock()
+	defer s.Unlock()
+
+	subReq := ClientMsg{
+		Action: "unlisten",
+		Data: map[string]interface{}{
+			"streams": []interface{}{
+				channel,
+			},
+		},
+	}
+
+	if err = s.conn.WriteJSON(subReq); err != nil {
+		return
+	}
+
+	return
+}
+
 func (s *Stream) isAuthenticated() bool {
 	return s.authenticated.Load().(bool)
 }
@@ -265,10 +306,15 @@ func GetStream() *Stream {
 
 func GetDataStream() *Stream {
 	dataOnce.Do(func() {
+		if s := os.Getenv("DATA_PROXY_WS"); s != "" {
+			streamUrl = s
+		} else {
+			streamUrl = dataURL
+		}
 		dataStr = &Stream{
 			authenticated: atomic.Value{},
 			handlers:      sync.Map{},
-			base:          dataUrl,
+			base:          streamUrl,
 		}
 
 		dataStr.authenticated.Store(false)

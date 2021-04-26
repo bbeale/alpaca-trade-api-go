@@ -2,6 +2,7 @@ package polygon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -58,6 +59,24 @@ func (s *Stream) Subscribe(channel string, handler func(msg interface{})) (err e
 		s.handlers.Delete(channel)
 		return
 	}
+
+	return
+}
+
+// Unsubscribe the specified Polygon stream channel.
+func (s *Stream) Unsubscribe(channel string) (err error) {
+	if s.conn == nil {
+		err = errors.New("not yet subscribed to any channel")
+		return
+	}
+
+	if err = s.auth(); err != nil {
+		return
+	}
+
+	s.handlers.Delete(channel)
+
+	err = s.unsub(channel)
 
 	return
 }
@@ -182,6 +201,20 @@ func (s *Stream) sub(channel string) (err error) {
 	return
 }
 
+func (s *Stream) unsub(channel string) (err error) {
+	s.Lock()
+	defer s.Unlock()
+
+	subReq := PolygonClientMsg{
+		Action: "unsubscribe",
+		Params: channel,
+	}
+
+	err = s.conn.WriteJSON(subReq)
+
+	return
+}
+
 func (s *Stream) isAuthenticated() bool {
 	return s.authenticated.Load().(bool)
 }
@@ -238,9 +271,17 @@ func GetStream() *Stream {
 }
 
 func openSocket() *websocket.Conn {
+	/*
+	 For backwards compatibility, POLYGON_WS_URL is kept but the proper way should be to use
+	 DATA_PROXY_WS both for the alpaca ws and the polygon ws.
+	*/
 	polygonStreamEndpoint, ok := os.LookupEnv("POLYGON_WS_URL")
 	if !ok {
-		polygonStreamEndpoint = "wss://alpaca.socket.polygon.io/stocks"
+		if s := os.Getenv("DATA_PROXY_WS"); s != "" {
+			polygonStreamEndpoint = s
+		} else {
+			polygonStreamEndpoint = "wss://socket.polygon.io/stocks"
+		}
 	}
 	connectionAttempts := 0
 	for connectionAttempts < MaxConnectionAttempts {

@@ -3,6 +3,7 @@ package alpaca
 import (
 	"time"
 
+	v2 "github.com/alpacahq/alpaca-trade-api-go/v2"
 	"github.com/shopspring/decimal"
 )
 
@@ -48,11 +49,13 @@ type Order struct {
 	FailedAt       *time.Time       `json:"failed_at"`
 	ReplacedAt     *time.Time       `json:"replaced_at"`
 	Replaces       *string          `json:"replaces"`
+	ReplacedBy     *string          `json:"replaced_by"`
 	AssetID        string           `json:"asset_id"`
 	Symbol         string           `json:"symbol"`
 	Exchange       string           `json:"exchange"`
 	Class          string           `json:"asset_class"`
 	Qty            decimal.Decimal  `json:"qty"`
+	Notional       decimal.Decimal  `json:"notional"`
 	FilledQty      decimal.Decimal  `json:"filled_qty"`
 	Type           OrderType        `json:"order_type"`
 	Side           Side             `json:"side"`
@@ -60,6 +63,9 @@ type Order struct {
 	LimitPrice     *decimal.Decimal `json:"limit_price"`
 	FilledAvgPrice *decimal.Decimal `json:"filled_avg_price"`
 	StopPrice      *decimal.Decimal `json:"stop_price"`
+	TrailPrice     *decimal.Decimal `json:"trail_price"`
+	TrailPercent   *decimal.Decimal `json:"trail_percent"`
+	Hwm            *decimal.Decimal `json:"hwm"`
 	Status         string           `json:"status"`
 	ExtendedHours  bool             `json:"extended_hours"`
 	Legs           *[]Order         `json:"legs"`
@@ -199,6 +205,34 @@ type Aggregates struct {
 	Results      []AggV2 `json:"results"`
 }
 
+type tradeResponse struct {
+	Symbol        string     `json:"symbol"`
+	NextPageToken *string    `json:"next_page_token"`
+	Trades        []v2.Trade `json:"trades"`
+}
+
+type quoteResponse struct {
+	Symbol        string     `json:"symbol"`
+	NextPageToken *string    `json:"next_page_token"`
+	Quotes        []v2.Quote `json:"quotes"`
+}
+
+type barResponse struct {
+	Symbol        string   `json:"symbol"`
+	NextPageToken *string  `json:"next_page_token"`
+	Bars          []v2.Bar `json:"bars"`
+}
+
+type latestTradeResponse struct {
+	Symbol string   `json:"symbol"`
+	Trade  v2.Trade `json:"trade"`
+}
+
+type latestQuoteResponse struct {
+	Symbol string   `json:"symbol"`
+	Quote  v2.Quote `json:"quote"`
+}
+
 type CalendarDay struct {
 	Date  string `json:"date"`
 	Open  string `json:"open"`
@@ -219,7 +253,7 @@ type AccountConfigurations struct {
 	TradeSuspendedByUser bool              `json:"trade_suspended_by_user"`
 }
 
-type AccountActvity struct {
+type AccountActivity struct {
 	ID              string          `json:"id"`
 	ActivityType    string          `json:"activity_type"`
 	TransactionTime time.Time       `json:"transaction_time"`
@@ -249,15 +283,19 @@ type PlaceOrderRequest struct {
 	AccountID     string           `json:"-"`
 	AssetKey      *string          `json:"symbol"`
 	Qty           decimal.Decimal  `json:"qty"`
+	Notional      decimal.Decimal  `json:"notional"`
 	Side          Side             `json:"side"`
 	Type          OrderType        `json:"type"`
 	TimeInForce   TimeInForce      `json:"time_in_force"`
 	LimitPrice    *decimal.Decimal `json:"limit_price"`
+	ExtendedHours bool             `json:"extended_hours"`
 	StopPrice     *decimal.Decimal `json:"stop_price"`
 	ClientOrderID string           `json:"client_order_id"`
 	OrderClass    OrderClass       `json:"order_class"`
 	TakeProfit    *TakeProfit      `json:"take_profit"`
 	StopLoss      *StopLoss        `json:"stop_loss"`
+	TrailPrice    *decimal.Decimal `json:"trail_price"`
+	TrailPercent  *decimal.Decimal `json:"trail_percent"`
 }
 
 type TakeProfit struct {
@@ -279,6 +317,7 @@ type ReplaceOrderRequest struct {
 	Qty           *decimal.Decimal `json:"qty"`
 	LimitPrice    *decimal.Decimal `json:"limit_price"`
 	StopPrice     *decimal.Decimal `json:"stop_price"`
+	Trail         *decimal.Decimal `json:"trail"`
 	TimeInForce   TimeInForce      `json:"time_in_force"`
 	ClientOrderID string           `json:"client_order_id"`
 }
@@ -309,18 +348,19 @@ const (
 type OrderType string
 
 const (
-	Market        OrderType = "market"
-	Limit         OrderType = "limit"
-	Stop          OrderType = "stop"
-	StopLimit     OrderType = "stop_limit"
-	MarketOnClose OrderType = "market_on_close"
-	LimitOnClose  OrderType = "limit_on_close"
+	Market       OrderType = "market"
+	Limit        OrderType = "limit"
+	Stop         OrderType = "stop"
+	StopLimit    OrderType = "stop_limit"
+	TrailingStop OrderType = "trailing_stop"
 )
 
 type OrderClass string
 
 const (
 	Bracket OrderClass = "bracket"
+	Oto     OrderClass = "oto"
+	Oco     OrderClass = "oco"
 	Simple  OrderClass = "simple"
 )
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,6 +14,12 @@ import (
 	"time"
 
 	"github.com/alpacahq/alpaca-trade-api-go/common"
+	v2 "github.com/alpacahq/alpaca-trade-api-go/v2"
+)
+
+const (
+	rateLimitRetryCount = 3
+	rateLimitRetryDelay = time.Second
 )
 
 var (
@@ -20,27 +27,49 @@ var (
 	// environment variable set credentials
 	DefaultClient = NewClient(common.Credentials())
 	base          = "https://api.alpaca.markets"
-	dataUrl       = "https://data.alpaca.markets"
+	dataURL       = "https://data.alpaca.markets"
 	apiVersion    = "v2"
-	do            = func(c *Client, req *http.Request) (*http.Response, error) {
-		if c.credentials.OAuth != "" {
-			req.Header.Set("Authorization", "Bearer "+c.credentials.OAuth)
-		} else {
-			req.Header.Set("APCA-API-KEY-ID", c.credentials.ID)
-			req.Header.Set("APCA-API-SECRET-KEY", c.credentials.Secret)
-		}
+	clientTimeout = 10 * time.Second
+	do            = defaultDo
+)
 
-		resp, err := http.DefaultClient.Do(req)
+func defaultDo(c *Client, req *http.Request) (*http.Response, error) {
+	if c.credentials.OAuth != "" {
+		req.Header.Set("Authorization", "Bearer "+c.credentials.OAuth)
+	} else {
+		req.Header.Set("APCA-API-KEY-ID", c.credentials.ID)
+		req.Header.Set("APCA-API-SECRET-KEY", c.credentials.Secret)
+	}
+
+	client := &http.Client{
+		Timeout: clientTimeout,
+	}
+	var resp *http.Response
+	var err error
+	for i := 0; ; i++ {
+		resp, err = client.Do(req)
 		if err != nil {
 			return nil, err
 		}
-
-		if err = verify(resp); err != nil {
-			return nil, err
+		if resp.StatusCode != http.StatusTooManyRequests {
+			break
 		}
-
-		return resp, nil
+		if i >= rateLimitRetryCount {
+			break
+		}
+		time.Sleep(rateLimitRetryDelay)
 	}
+
+	if err = verify(resp); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+const (
+	// v2MaxLimit is the maximum allowed limit parameter for all v2 endpoints
+	v2MaxLimit = 10000
 )
 
 func init() {
@@ -51,10 +80,21 @@ func init() {
 		base = s
 	}
 	if s := os.Getenv("APCA_DATA_URL"); s != "" {
-		dataUrl = s
+		dataURL = s
+	}
+	// also allow APCA_API_DATA_URL to be consistent with the python SDK
+	if s := os.Getenv("APCA_API_DATA_URL"); s != "" {
+		dataURL = s
 	}
 	if s := os.Getenv("APCA_API_VERSION"); s != "" {
 		apiVersion = s
+	}
+	if s := os.Getenv("APCA_API_CLIENT_TIMEOUT"); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			log.Fatal("invalid APCA_API_CLIENT_TIMEOUT: " + err.Error())
+		}
+		clientTimeout = d
 	}
 }
 
@@ -147,7 +187,7 @@ func (c *Client) UpdateAccountConfigurations(newConfigs AccountConfigurationsReq
 	return configs, nil
 }
 
-func (c *Client) GetAccountActivities(activityType *string, opts *AccountActivitiesRequest) ([]AccountActvity, error) {
+func (c *Client) GetAccountActivities(activityType *string, opts *AccountActivitiesRequest) ([]AccountActivity, error) {
 	var u *url.URL
 	var err error
 	if activityType == nil {
@@ -177,7 +217,7 @@ func (c *Client) GetAccountActivities(activityType *string, opts *AccountActivit
 			q.Set("direction", *opts.Direction)
 		}
 		if opts.PageSize != nil {
-			q.Set("page_size", string(*opts.PageSize))
+			q.Set("page_size", strconv.Itoa(*opts.PageSize))
 		}
 	}
 
@@ -188,7 +228,7 @@ func (c *Client) GetAccountActivities(activityType *string, opts *AccountActivit
 		return nil, err
 	}
 
-	activities := []AccountActvity{}
+	activities := []AccountActivity{}
 
 	if err = unmarshal(resp, &activities); err != nil {
 		return nil, err
@@ -288,7 +328,7 @@ func (c *Client) GetPosition(symbol string) (*Position, error) {
 // GetAggregates returns the bars for the given symbol, timespan and date-range
 func (c *Client) GetAggregates(symbol, timespan, from, to string) (*Aggregates, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/v1/aggs/ticker/%s/range/1/%s/%s/%s",
-		dataUrl, symbol, timespan, from, to))
+		dataURL, symbol, timespan, from, to))
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +358,7 @@ func (c *Client) GetAggregates(symbol, timespan, from, to string) (*Aggregates, 
 
 // GetLastQuote returns the last quote for the given symbol
 func (c *Client) GetLastQuote(symbol string) (*LastQuoteResponse, error) {
-	u, err := url.Parse(fmt.Sprintf("%s/v1/last_quote/stocks/%s", dataUrl, symbol))
+	u, err := url.Parse(fmt.Sprintf("%s/v1/last_quote/stocks/%s", dataURL, symbol))
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +385,7 @@ func (c *Client) GetLastQuote(symbol string) (*LastQuoteResponse, error) {
 
 // GetLastTrade returns the last trade for the given symbol
 func (c *Client) GetLastTrade(symbol string) (*LastTradeResponse, error) {
-	u, err := url.Parse(fmt.Sprintf("%s/v1/last/stocks/%s", dataUrl, symbol))
+	u, err := url.Parse(fmt.Sprintf("%s/v1/last/stocks/%s", dataURL, symbol))
 	if err != nil {
 		return nil, err
 	}
@@ -368,6 +408,231 @@ func (c *Client) GetLastTrade(symbol string) (*LastTradeResponse, error) {
 	}
 
 	return lastTrade, nil
+}
+
+// GetTrades returns a channel that will be populated with the trades for the given symbol
+// that happened between the given start and end times, limited to the given limit.
+func (c *Client) GetTrades(symbol string, start, end time.Time, limit int) <-chan v2.TradeItem {
+	ch := make(chan v2.TradeItem)
+
+	go func() {
+		defer close(ch)
+
+		u, err := url.Parse(fmt.Sprintf("%s/v2/stocks/%s/trades", dataURL, symbol))
+		if err != nil {
+			ch <- v2.TradeItem{Error: err}
+			return
+		}
+
+		q := u.Query()
+		q.Set("start", start.Format(time.RFC3339))
+		q.Set("end", end.Format(time.RFC3339))
+
+		total := 0
+		pageToken := ""
+		for {
+			actualLimit := limit - total
+			if actualLimit <= 0 {
+				return
+			}
+			if actualLimit > v2MaxLimit {
+				actualLimit = v2MaxLimit
+			}
+			q.Set("limit", fmt.Sprintf("%d", actualLimit))
+			q.Set("page_token", pageToken)
+			u.RawQuery = q.Encode()
+
+			resp, err := c.get(u)
+			if err != nil {
+				ch <- v2.TradeItem{Error: err}
+				return
+			}
+
+			var tradeResp tradeResponse
+			if err = unmarshal(resp, &tradeResp); err != nil {
+				ch <- v2.TradeItem{Error: err}
+				return
+			}
+
+			for _, trade := range tradeResp.Trades {
+				ch <- v2.TradeItem{Trade: trade}
+			}
+			if tradeResp.NextPageToken == nil {
+				return
+			}
+			pageToken = *tradeResp.NextPageToken
+			total += len(tradeResp.Trades)
+		}
+	}()
+
+	return ch
+}
+
+// GetQuotes returns a channel that will be populated with the quotes for the given symbol
+// that happened between the given start and end times, limited to the given limit.
+func (c *Client) GetQuotes(symbol string, start, end time.Time, limit int) <-chan v2.QuoteItem {
+	// NOTE: this method is very similar to GetTrades.
+	// With generics it would be almost trivial to refactor them to use a common base method,
+	// but without them it doesn't seem to be worth it
+	ch := make(chan v2.QuoteItem)
+
+	go func() {
+		defer close(ch)
+
+		u, err := url.Parse(fmt.Sprintf("%s/v2/stocks/%s/quotes", dataURL, symbol))
+		if err != nil {
+			ch <- v2.QuoteItem{Error: err}
+			return
+		}
+
+		q := u.Query()
+		q.Set("start", start.Format(time.RFC3339))
+		q.Set("end", end.Format(time.RFC3339))
+
+		total := 0
+		pageToken := ""
+		for {
+			actualLimit := limit - total
+			if actualLimit <= 0 {
+				return
+			}
+			if actualLimit > v2MaxLimit {
+				actualLimit = v2MaxLimit
+			}
+			q.Set("limit", fmt.Sprintf("%d", actualLimit))
+			q.Set("page_token", pageToken)
+			u.RawQuery = q.Encode()
+
+			resp, err := c.get(u)
+			if err != nil {
+				ch <- v2.QuoteItem{Error: err}
+				return
+			}
+
+			var quoteResp quoteResponse
+			if err = unmarshal(resp, &quoteResp); err != nil {
+				ch <- v2.QuoteItem{Error: err}
+				return
+			}
+
+			for _, quote := range quoteResp.Quotes {
+				ch <- v2.QuoteItem{Quote: quote}
+			}
+			if quoteResp.NextPageToken == nil {
+				return
+			}
+			pageToken = *quoteResp.NextPageToken
+			total += len(quoteResp.Quotes)
+		}
+	}()
+
+	return ch
+}
+
+// GetBars returns a channel that will be populated with the bars for the given symbol
+// between the given start and end times, limited to the given limit,
+// using the given and timeframe and adjustment.
+func (c *Client) GetBars(
+	symbol string, timeFrame v2.TimeFrame, adjustment v2.Adjustment,
+	start, end time.Time, limit int,
+) <-chan v2.BarItem {
+	ch := make(chan v2.BarItem)
+
+	go func() {
+		defer close(ch)
+
+		u, err := url.Parse(fmt.Sprintf("%s/v2/stocks/%s/bars", dataURL, symbol))
+		if err != nil {
+			ch <- v2.BarItem{Error: err}
+			return
+		}
+
+		q := u.Query()
+		q.Set("start", start.Format(time.RFC3339))
+		q.Set("end", end.Format(time.RFC3339))
+		q.Set("adjustment", string(adjustment))
+		q.Set("timeframe", string(timeFrame))
+
+		total := 0
+		pageToken := ""
+		for {
+			actualLimit := limit - total
+			if actualLimit <= 0 {
+				return
+			}
+			if actualLimit > v2MaxLimit {
+				actualLimit = v2MaxLimit
+			}
+			q.Set("limit", fmt.Sprintf("%d", actualLimit))
+			q.Set("page_token", pageToken)
+			u.RawQuery = q.Encode()
+
+			resp, err := c.get(u)
+			if err != nil {
+				ch <- v2.BarItem{Error: err}
+				return
+			}
+
+			var barResp barResponse
+			if err = unmarshal(resp, &barResp); err != nil {
+				ch <- v2.BarItem{Error: err}
+				return
+			}
+
+			for _, bar := range barResp.Bars {
+				ch <- v2.BarItem{Bar: bar}
+			}
+			if barResp.NextPageToken == nil {
+				return
+			}
+			pageToken = *barResp.NextPageToken
+			total += len(barResp.Bars)
+		}
+	}()
+
+	return ch
+}
+
+// GetLatestTrade returns the latest trade for a given symbol
+func (c *Client) GetLatestTrade(symbol string) (*v2.Trade, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/v2/stocks/%s/trades/latest", dataURL, symbol))
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.get(u)
+	if err != nil {
+		return nil, err
+	}
+
+	var latestTradeResp latestTradeResponse
+
+	if err = unmarshal(resp, &latestTradeResp); err != nil {
+		return nil, err
+	}
+
+	return &latestTradeResp.Trade, nil
+}
+
+// GetLatestQuote returns the latest quote for a given symbol
+func (c *Client) GetLatestQuote(symbol string) (*v2.Quote, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/v2/stocks/%s/quotes/latest", dataURL, symbol))
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.get(u)
+	if err != nil {
+		return nil, err
+	}
+
+	var latestQuoteResp latestQuoteResponse
+
+	if err = unmarshal(resp, &latestQuoteResp); err != nil {
+		return nil, err
+	}
+
+	return &latestQuoteResp.Quote, nil
 }
 
 // CloseAllPositions liquidates all open positions at market price.
@@ -539,6 +804,31 @@ func (c *Client) GetOrder(orderID string) (*Order, error) {
 	return order, nil
 }
 
+// GetOrderByClientOrderID submits a request to get an order by the client order ID.
+func (c *Client) GetOrderByClientOrderID(clientOrderID string) (*Order, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/%s/orders:by_client_order_id", base, apiVersion))
+	if err != nil {
+		return nil, err
+	}
+
+	q := u.Query()
+	q.Set("client_order_id", clientOrderID)
+	u.RawQuery = q.Encode()
+
+	resp, err := c.get(u)
+	if err != nil {
+		return nil, err
+	}
+
+	order := &Order{}
+
+	if err = unmarshal(resp, order); err != nil {
+		return nil, err
+	}
+
+	return order, nil
+}
+
 // ReplaceOrder submits a request to replace an order by id
 func (c *Client) ReplaceOrder(orderID string, req ReplaceOrderRequest) (*Order, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/%s/orders/%s", base, apiVersion, orderID))
@@ -653,18 +943,18 @@ func (c *Client) ListBars(symbols []string, opts ListBarParams) (map[string][]Ba
 	}
 
 	if opts.StartDt != nil {
-		vals.Set("start_dt", opts.StartDt.Format(time.RFC3339))
+		vals.Set("start", opts.StartDt.Format(time.RFC3339))
 	}
 
 	if opts.EndDt != nil {
-		vals.Set("end_dt", opts.EndDt.Format(time.RFC3339))
+		vals.Set("end", opts.EndDt.Format(time.RFC3339))
 	}
 
 	if opts.Limit != nil {
 		vals.Set("limit", strconv.FormatInt(int64(*opts.Limit), 10))
 	}
 
-	u, err := url.Parse(fmt.Sprintf("%s/v1/bars/%s?%v", dataUrl, opts.Timeframe, vals.Encode()))
+	u, err := url.Parse(fmt.Sprintf("%s/v1/bars/%s?%v", dataURL, opts.Timeframe, vals.Encode()))
 	if err != nil {
 		return nil, err
 	}
@@ -713,7 +1003,7 @@ func UpdateAccountConfigurations(newConfigs AccountConfigurationsRequest) (*Acco
 	return DefaultClient.UpdateAccountConfigurations(newConfigs)
 }
 
-func GetAccountActivities(activityType *string, opts *AccountActivitiesRequest) ([]AccountActvity, error) {
+func GetAccountActivities(activityType *string, opts *AccountActivitiesRequest) ([]AccountActivity, error) {
 	return DefaultClient.GetAccountActivities(activityType, opts)
 }
 
@@ -740,6 +1030,38 @@ func GetLastQuote(symbol string) (*LastQuoteResponse, error) {
 // GetLastTrade returns the last trade for the given symbol
 func GetLastTrade(symbol string) (*LastTradeResponse, error) {
 	return DefaultClient.GetLastTrade(symbol)
+}
+
+// GetTrades returns a channel that will be populated with the trades for the given symbol
+// that happened between the given start and end times, limited to the given limit.
+func GetTrades(symbol string, start, end time.Time, limit int) <-chan v2.TradeItem {
+	return DefaultClient.GetTrades(symbol, start, end, limit)
+}
+
+// GetQuotes returns a channel that will be populated with the quotes for the given symbol
+// that happened between the given start and end times, limited to the given limit.
+func GetQuotes(symbol string, start, end time.Time, limit int) <-chan v2.QuoteItem {
+	return DefaultClient.GetQuotes(symbol, start, end, limit)
+}
+
+// GetBars returns a channel that will be populated with the bars for the given symbol
+// between the given start and end times, limited to the given limit,
+// using the given and timeframe and adjustment.
+func GetBars(
+	symbol string, timeFrame v2.TimeFrame, adjustment v2.Adjustment,
+	start, end time.Time, limit int,
+) <-chan v2.BarItem {
+	return DefaultClient.GetBars(symbol, timeFrame, adjustment, start, end, limit)
+}
+
+// GetLatestTrade returns the latest trade for a given symbol
+func GetLatestTrade(symbol string) (*v2.Trade, error) {
+	return DefaultClient.GetLatestTrade(symbol)
+}
+
+// GetLatestTrade returns the latest quote for a given symbol
+func GetLatestQuote(symbol string) (*v2.Quote, error) {
+	return DefaultClient.GetLatestQuote(symbol)
 }
 
 // GetPosition returns the account's position for the
@@ -777,6 +1099,12 @@ func PlaceOrder(req PlaceOrderRequest) (*Order, error) {
 // `orderID` using the default Alpaca client.
 func GetOrder(orderID string) (*Order, error) {
 	return DefaultClient.GetOrder(orderID)
+}
+
+// GetOrderByClientOrderID returns a single order for the given
+// `clientOrderID` using the default Alpaca client.
+func GetOrderByClientOrderID(clientOrderID string) (*Order, error) {
+	return DefaultClient.GetOrderByClientOrderID(clientOrderID)
 }
 
 // ReplaceOrder changes an order by order id
@@ -880,6 +1208,9 @@ func verify(resp *http.Response) (err error) {
 		apiErr := APIError{}
 
 		err = json.Unmarshal(body, &apiErr)
+		if err != nil {
+			return fmt.Errorf("json unmarshal error: %s", err.Error())
+		}
 		if err == nil {
 			err = &apiErr
 		}
@@ -897,4 +1228,31 @@ func unmarshal(resp *http.Response, data interface{}) error {
 	}
 
 	return json.Unmarshal(body, data)
+}
+
+// alias POR to avoid entering an infinite loop when MarshalJSON is called
+type localPlaceOrderRequest PlaceOrderRequest
+
+func (req PlaceOrderRequest) MarshalJSON() ([]byte, error) {
+	// marshal original POR
+	buf, err := json.Marshal(localPlaceOrderRequest(req))
+	if err != nil {
+		return nil, err
+	}
+
+	// unmarshal to allow updates
+	data := make(map[string]interface{})
+	if err = json.Unmarshal(buf, &data); err != nil {
+		return nil, err
+	}
+
+	// remove zero-value struct fields related to order size
+	if req.Notional.IsZero() {
+		delete(data, "notional")
+	}
+	if req.Qty.IsZero() {
+		delete(data, "qty")
+	}
+
+	return json.Marshal(data)
 }
